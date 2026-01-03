@@ -1,0 +1,11 @@
+{
+  "bind_host": "0.0.0.0",
+  "port": 9000,
+  "data_dir": "./data",
+  "db_path": "./data/db/chat.db",
+  "log_level": "info",
+  "thread_pool_size": 4,
+  "max_clients": 1000,
+  "history_page_size": 100,
+  "file_chunk_size": 65536
+}

@@ -1,0 +1,10 @@
+{
+  "server_host": "127.0.0.1",
+  "server_port": 9000,
+  "data_dir": "./data",
+  "log_level": "info",
+  "history_page_size": 100,
+  "window_width": 1024,
+  "window_height": 720,
+  "emoji_font_path": "./assets/fonts/NotoColorEmoji.ttf"
+}
