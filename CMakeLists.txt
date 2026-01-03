@@ -56,6 +56,9 @@ target_link_libraries(onlinetalk_common
 
 add_executable(onlinetalk_server
   src/server/main.cpp
+  src/server/net/connection.cpp
+  src/server/net/tcp_server.cpp
+  src/server/session/session_manager.cpp
 )
 
 target_link_libraries(onlinetalk_server

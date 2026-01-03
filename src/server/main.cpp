@@ -1,6 +1,7 @@
 #include "common/config.h"
 #include "common/fs.h"
 #include "common/log.h"
+#include "server/net/tcp_server.h"
 
 #include <iostream>
 #include <string>
@@ -35,15 +36,17 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Info,
-                                    "bind " + config.bind_host + ":" + std::to_string(config.port));
-    onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Info,
-                                    "db path: " + config.db_path);
-    onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Info,
-                                    "thread pool size: " + std::to_string(config.thread_pool_size));
+    onlinetalk::server::TcpServer server(config);
+    if (!server.start(&error)) {
+      onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Error,
+                                      "server start failed: " + error);
+      return 1;
+    }
 
-    onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
-                                    "server core not implemented yet");
+    onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Info,
+                                    "server listening on " + config.bind_host + ":" +
+                                        std::to_string(config.port));
+    server.run();
     return 0;
   } catch (const onlinetalk::common::ConfigError& ex) {
     std::cerr << "config error: " << ex.what() << std::endl;
