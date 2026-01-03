@@ -25,6 +25,7 @@ class SessionManager {
   bool login(int fd, const std::string& user_id, const std::string& nickname, std::string* error);
   void logout(int fd);
   bool isLoggedIn(int fd) const;
+  bool tryGetFd(const std::string& user_id, int* fd) const;
   std::vector<OnlineUser> onlineUsers() const;
   const Session* getSession(int fd) const;
 

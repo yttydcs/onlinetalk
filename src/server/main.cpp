@@ -57,6 +57,14 @@ int main(int argc, char** argv) {
                                       "failed to create data_dir: " + error);
       return 1;
     }
+    const auto db_dir = std::filesystem::path(config.db_path).parent_path();
+    if (!db_dir.empty()) {
+      if (!onlinetalk::common::ensureDirectory(db_dir.string(), &error)) {
+        onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Error,
+                                        "failed to create db_dir: " + error);
+        return 1;
+      }
+    }
 
     onlinetalk::server::TcpServer server(config);
     if (!server.start(&error)) {

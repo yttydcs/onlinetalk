@@ -58,7 +58,12 @@ add_executable(onlinetalk_server
   src/server/main.cpp
   src/server/net/connection.cpp
   src/server/net/tcp_server.cpp
+  src/server/services/auth_service.cpp
+  src/server/services/group_service.cpp
+  src/server/services/id_generator.cpp
+  src/server/services/message_service.cpp
   src/server/session/session_manager.cpp
+  src/server/storage/database.cpp
 )
 
 target_link_libraries(onlinetalk_server

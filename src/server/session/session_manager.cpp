@@ -59,6 +59,18 @@ bool SessionManager::isLoggedIn(int fd) const {
   return it != sessions_.end() && it->second.logged_in;
 }
 
+bool SessionManager::tryGetFd(const std::string& user_id, int* fd) const {
+  if (!fd) {
+    return false;
+  }
+  auto it = user_to_fd_.find(user_id);
+  if (it == user_to_fd_.end()) {
+    return false;
+  }
+  *fd = it->second;
+  return true;
+}
+
 std::vector<OnlineUser> SessionManager::onlineUsers() const {
   std::vector<OnlineUser> users;
   users.reserve(user_to_fd_.size());

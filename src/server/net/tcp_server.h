@@ -10,7 +10,11 @@
 #include "common/net/byte_buffer.h"
 #include "common/protocol/packet.h"
 #include "server/net/connection.h"
+#include "server/services/auth_service.h"
+#include "server/services/group_service.h"
+#include "server/services/message_service.h"
 #include "server/session/session_manager.h"
+#include "server/storage/database.h"
 
 namespace onlinetalk::server {
 
@@ -35,11 +39,23 @@ class TcpServer {
                   std::string* error) const;
 
   void handleAuth(Connection& conn, const onlinetalk::common::Packet& packet);
+  void handleRegister(Connection& conn, const onlinetalk::common::Packet& packet);
+  void handleLogin(Connection& conn, const onlinetalk::common::Packet& packet);
+  void handleGroup(Connection& conn, const onlinetalk::common::Packet& packet);
+  void handleMessage(Connection& conn, const onlinetalk::common::Packet& packet);
+  void deliverOfflineMessages(const std::string& user_id, Connection& conn);
   void sendAuthError(Connection& conn,
                      uint64_t request_id,
                      const std::string& code,
                      const std::string& message);
   void sendAuthOk(Connection& conn, uint64_t request_id);
+  void sendResponse(Connection& conn,
+                    onlinetalk::common::PacketType type,
+                    uint64_t request_id,
+                    const std::string& status,
+                    const std::string& code,
+                    const std::string& message,
+                    const std::string& extra_meta_json);
   void broadcastUserList();
   std::vector<uint8_t> buildPacket(onlinetalk::common::PacketType type,
                                    uint64_t request_id,
@@ -47,6 +63,7 @@ class TcpServer {
                                    const std::vector<uint8_t>* binary);
   void updateEpollEvents(int fd, bool want_write);
   void disconnect(int fd);
+  bool initDatabase(std::string* error);
 
   onlinetalk::common::ServerConfig config_;
   int listen_fd_ = -1;
@@ -54,6 +71,10 @@ class TcpServer {
   bool running_ = false;
   SessionManager sessions_;
   std::unordered_map<int, std::unique_ptr<Connection>> connections_;
+  Database database_;
+  AuthService auth_service_;
+  GroupService group_service_;
+  MessageService message_service_;
 };
 
 }  // namespace onlinetalk::server

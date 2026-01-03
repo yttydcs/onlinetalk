@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <netdb.h>
+#include <algorithm>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
@@ -22,6 +23,7 @@ namespace {
 
 constexpr int kMaxEvents = 64;
 constexpr size_t kMaxFieldLength = 64;
+constexpr size_t kMaxContentLength = 4096;
 
 bool setNonBlocking(int fd, std::string* error) {
   const int flags = ::fcntl(fd, F_GETFL, 0);
@@ -148,14 +150,14 @@ bool parseJson(const std::string& text, nlohmann::json* out, std::string* error)
   }
 }
 
-bool validateField(const std::string& value, const std::string& field, std::string* error) {
+bool validateField(const std::string& value, const std::string& field, size_t max_len, std::string* error) {
   if (value.empty()) {
     if (error) {
       *error = field + " is required";
     }
     return false;
   }
-  if (value.size() > kMaxFieldLength) {
+  if (value.size() > max_len) {
     if (error) {
       *error = field + " too long";
     }
@@ -166,13 +168,21 @@ bool validateField(const std::string& value, const std::string& field, std::stri
 
 }  // namespace
 
-TcpServer::TcpServer(const onlinetalk::common::ServerConfig& config) : config_(config) {}
+TcpServer::TcpServer(const onlinetalk::common::ServerConfig& config)
+    : config_(config),
+      database_(),
+      auth_service_(database_),
+      group_service_(database_),
+      message_service_(database_) {}
 
 TcpServer::~TcpServer() {
   stop();
 }
 
 bool TcpServer::start(std::string* error) {
+  if (!initDatabase(error)) {
+    return false;
+  }
   if (!setupListener(error)) {
     return false;
   }
@@ -351,6 +361,15 @@ bool TcpServer::processPackets(Connection& conn) {
       case onlinetalk::common::PacketType::AuthRegister:
         handleAuth(conn, packet);
         break;
+      case onlinetalk::common::PacketType::GroupCreate:
+      case onlinetalk::common::PacketType::GroupJoin:
+      case onlinetalk::common::PacketType::GroupLeave:
+      case onlinetalk::common::PacketType::GroupAdmin:
+        handleGroup(conn, packet);
+        break;
+      case onlinetalk::common::PacketType::MessageSend:
+        handleMessage(conn, packet);
+        break;
       default:
         onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
                                         "unhandled packet type: " + std::to_string(packet.header.type));
@@ -422,6 +441,15 @@ bool TcpServer::peekHeader(const onlinetalk::common::ByteBuffer& buffer,
 }
 
 void TcpServer::handleAuth(Connection& conn, const onlinetalk::common::Packet& packet) {
+  const auto type = static_cast<onlinetalk::common::PacketType>(packet.header.type);
+  if (type == onlinetalk::common::PacketType::AuthRegister) {
+    handleRegister(conn, packet);
+    return;
+  }
+  handleLogin(conn, packet);
+}
+
+void TcpServer::handleRegister(Connection& conn, const onlinetalk::common::Packet& packet) {
   nlohmann::json meta;
   std::string error;
   if (!parseJson(packet.meta_json, &meta, &error)) {
@@ -433,28 +461,374 @@ void TcpServer::handleAuth(Connection& conn, const onlinetalk::common::Packet& p
   const auto nickname = meta.value("nickname", "");
   const auto password = meta.value("password", "");
 
-  if (!validateField(user_id, "user_id", &error)) {
+  if (!validateField(user_id, "user_id", kMaxFieldLength, &error)) {
     sendAuthError(conn, packet.header.request_id, "INVALID_USER_ID", error);
     return;
   }
-  if (!validateField(nickname, "nickname", &error)) {
+  if (!validateField(nickname, "nickname", kMaxFieldLength, &error)) {
     sendAuthError(conn, packet.header.request_id, "INVALID_NICKNAME", error);
     return;
   }
-  if (!validateField(password, "password", &error)) {
+  if (!validateField(password, "password", kMaxFieldLength, &error)) {
     sendAuthError(conn, packet.header.request_id, "INVALID_PASSWORD", error);
     return;
   }
 
-  if (!sessions_.login(conn.fd(), user_id, nickname, &error)) {
+  if (!auth_service_.registerUser(user_id, nickname, password, &error)) {
+    sendAuthError(conn, packet.header.request_id, "REGISTER_FAILED", error);
+    return;
+  }
+
+  nlohmann::json extra;
+  extra["registered"] = true;
+  extra["logged_in"] = false;
+  sendResponse(conn,
+               onlinetalk::common::PacketType::AuthOk,
+               packet.header.request_id,
+               "ok",
+               "",
+               "",
+               extra.dump());
+}
+
+void TcpServer::handleLogin(Connection& conn, const onlinetalk::common::Packet& packet) {
+  nlohmann::json meta;
+  std::string error;
+  if (!parseJson(packet.meta_json, &meta, &error)) {
+    sendAuthError(conn, packet.header.request_id, "INVALID_JSON", error);
+    return;
+  }
+
+  const auto user_id = meta.value("user_id", "");
+  const auto password = meta.value("password", "");
+
+  if (!validateField(user_id, "user_id", kMaxFieldLength, &error)) {
+    sendAuthError(conn, packet.header.request_id, "INVALID_USER_ID", error);
+    return;
+  }
+  if (!validateField(password, "password", kMaxFieldLength, &error)) {
+    sendAuthError(conn, packet.header.request_id, "INVALID_PASSWORD", error);
+    return;
+  }
+
+  AuthUser user;
+  if (!auth_service_.loginUser(user_id, password, &user, &error)) {
+    sendAuthError(conn, packet.header.request_id, "LOGIN_FAILED", error);
+    return;
+  }
+  if (!sessions_.login(conn.fd(), user.user_id, user.nickname, &error)) {
     sendAuthError(conn, packet.header.request_id, "LOGIN_FAILED", error);
     return;
   }
 
   onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Info,
-                                  "login ok: " + user_id);
+                                  "login ok: " + user.user_id);
   sendAuthOk(conn, packet.header.request_id);
   broadcastUserList();
+  deliverOfflineMessages(user.user_id, conn);
+}
+
+void TcpServer::handleGroup(Connection& conn, const onlinetalk::common::Packet& packet) {
+  const auto* session = sessions_.getSession(conn.fd());
+  if (!session || !session->logged_in) {
+    sendResponse(conn,
+                 static_cast<onlinetalk::common::PacketType>(packet.header.type),
+                 packet.header.request_id,
+                 "error",
+                 "NOT_LOGGED_IN",
+                 "login required",
+                 "");
+    return;
+  }
+
+  nlohmann::json meta;
+  std::string error;
+  if (!parseJson(packet.meta_json, &meta, &error)) {
+    sendResponse(conn,
+                 static_cast<onlinetalk::common::PacketType>(packet.header.type),
+                 packet.header.request_id,
+                 "error",
+                 "INVALID_JSON",
+                 error,
+                 "");
+    return;
+  }
+
+  const auto type = static_cast<onlinetalk::common::PacketType>(packet.header.type);
+  if (type == onlinetalk::common::PacketType::GroupCreate) {
+    const auto name = meta.value("name", "");
+    if (!validateField(name, "name", kMaxFieldLength, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_NAME", error, "");
+      return;
+    }
+    std::string group_id;
+    if (!group_service_.createGroup(session->user_id, name, &group_id, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "CREATE_FAILED", error, "");
+      return;
+    }
+    nlohmann::json extra;
+    extra["group_id"] = group_id;
+    extra["name"] = name;
+    sendResponse(conn, type, packet.header.request_id, "ok", "", "", extra.dump());
+    return;
+  }
+
+  if (type == onlinetalk::common::PacketType::GroupJoin) {
+    const auto group_id = meta.value("group_id", "");
+    if (!validateField(group_id, "group_id", kMaxFieldLength, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_GROUP_ID", error, "");
+      return;
+    }
+    if (!group_service_.joinGroup(session->user_id, group_id, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "JOIN_FAILED", error, "");
+      return;
+    }
+    sendResponse(conn, type, packet.header.request_id, "ok", "", "", "");
+    return;
+  }
+
+  if (type == onlinetalk::common::PacketType::GroupLeave) {
+    const auto group_id = meta.value("group_id", "");
+    if (!validateField(group_id, "group_id", kMaxFieldLength, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_GROUP_ID", error, "");
+      return;
+    }
+    if (!group_service_.leaveGroup(session->user_id, group_id, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "LEAVE_FAILED", error, "");
+      return;
+    }
+    sendResponse(conn, type, packet.header.request_id, "ok", "", "", "");
+    return;
+  }
+
+  if (type == onlinetalk::common::PacketType::GroupAdmin) {
+    const auto action = meta.value("action", "");
+    const auto group_id = meta.value("group_id", "");
+    if (!validateField(action, "action", kMaxFieldLength, &error) ||
+        !validateField(group_id, "group_id", kMaxFieldLength, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_REQUEST", error, "");
+      return;
+    }
+
+    if (action == "rename") {
+      const auto new_name = meta.value("name", "");
+      if (!validateField(new_name, "name", kMaxFieldLength, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "INVALID_NAME", error, "");
+        return;
+      }
+      if (!group_service_.renameGroup(session->user_id, group_id, new_name, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "RENAME_FAILED", error, "");
+        return;
+      }
+      sendResponse(conn, type, packet.header.request_id, "ok", "", "", "");
+      return;
+    }
+
+    if (action == "kick") {
+      const auto target = meta.value("target_user_id", "");
+      if (!validateField(target, "target_user_id", kMaxFieldLength, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "INVALID_TARGET", error, "");
+        return;
+      }
+      if (!group_service_.kickUser(session->user_id, group_id, target, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "KICK_FAILED", error, "");
+        return;
+      }
+      sendResponse(conn, type, packet.header.request_id, "ok", "", "", "");
+      return;
+    }
+
+    if (action == "dissolve") {
+      if (!group_service_.dissolveGroup(session->user_id, group_id, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "DISSOLVE_FAILED", error, "");
+        return;
+      }
+      sendResponse(conn, type, packet.header.request_id, "ok", "", "", "");
+      return;
+    }
+
+    if (action == "promote" || action == "demote") {
+      const auto target = meta.value("target_user_id", "");
+      if (!validateField(target, "target_user_id", kMaxFieldLength, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "INVALID_TARGET", error, "");
+        return;
+      }
+      const bool make_admin = (action == "promote");
+      if (!group_service_.setAdmin(session->user_id, group_id, target, make_admin, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "ADMIN_FAILED", error, "");
+        return;
+      }
+      sendResponse(conn, type, packet.header.request_id, "ok", "", "", "");
+      return;
+    }
+
+    sendResponse(conn, type, packet.header.request_id, "error", "UNKNOWN_ACTION", "unsupported action", "");
+    return;
+  }
+}
+
+void TcpServer::handleMessage(Connection& conn, const onlinetalk::common::Packet& packet) {
+  const auto* session = sessions_.getSession(conn.fd());
+  if (!session || !session->logged_in) {
+    sendResponse(conn,
+                 static_cast<onlinetalk::common::PacketType>(packet.header.type),
+                 packet.header.request_id,
+                 "error",
+                 "NOT_LOGGED_IN",
+                 "login required",
+                 "");
+    return;
+  }
+
+  nlohmann::json meta;
+  std::string error;
+  if (!parseJson(packet.meta_json, &meta, &error)) {
+    sendResponse(conn,
+                 static_cast<onlinetalk::common::PacketType>(packet.header.type),
+                 packet.header.request_id,
+                 "error",
+                 "INVALID_JSON",
+                 error,
+                 "");
+    return;
+  }
+
+  const auto conversation_type = meta.value("conversation_type", "");
+  const auto conversation_id = meta.value("conversation_id", "");
+  const auto content = meta.value("content", "");
+
+  if (!validateField(conversation_type, "conversation_type", kMaxFieldLength, &error) ||
+      !validateField(conversation_id, "conversation_id", kMaxFieldLength, &error) ||
+      !validateField(content, "content", kMaxContentLength, &error)) {
+    sendResponse(conn, onlinetalk::common::PacketType::MessageSend, packet.header.request_id,
+                 "error", "INVALID_REQUEST", error, "");
+    return;
+  }
+
+  std::vector<std::string> recipients;
+  if (conversation_type == "private") {
+    std::string exists_error;
+    const bool exists = auth_service_.userExists(conversation_id, &exists_error);
+    if (!exists_error.empty()) {
+      sendResponse(conn, onlinetalk::common::PacketType::MessageSend, packet.header.request_id,
+                   "error", "USER_LOOKUP_FAILED", exists_error, "");
+      return;
+    }
+    if (!exists) {
+      sendResponse(conn, onlinetalk::common::PacketType::MessageSend, packet.header.request_id,
+                   "error", "TARGET_NOT_FOUND", "target user not found", "");
+      return;
+    }
+    recipients.push_back(conversation_id);
+  } else if (conversation_type == "group") {
+    std::string role;
+    if (!group_service_.getUserRole(session->user_id, conversation_id, &role, &error)) {
+      sendResponse(conn, onlinetalk::common::PacketType::MessageSend, packet.header.request_id,
+                   "error", "NOT_IN_GROUP", error, "");
+      return;
+    }
+    if (!group_service_.getGroupMembers(conversation_id, &recipients, &error)) {
+      sendResponse(conn, onlinetalk::common::PacketType::MessageSend, packet.header.request_id,
+                   "error", "GROUP_MEMBERS_FAILED", error, "");
+      return;
+    }
+    recipients.erase(std::remove(recipients.begin(), recipients.end(), session->user_id), recipients.end());
+    if (recipients.empty()) {
+      sendResponse(conn, onlinetalk::common::PacketType::MessageSend, packet.header.request_id,
+                   "error", "NO_RECIPIENTS", "no recipients available", "");
+      return;
+    }
+  } else {
+    sendResponse(conn, onlinetalk::common::PacketType::MessageSend, packet.header.request_id,
+                 "error", "INVALID_CONVERSATION_TYPE", "use private or group", "");
+    return;
+  }
+
+  MessageInput input;
+  input.conversation_type = conversation_type;
+  input.conversation_id = conversation_id;
+  input.sender_id = session->user_id;
+  input.sender_nickname = session->nickname;
+  input.content = content;
+
+  StoredMessage stored;
+  if (!message_service_.storeMessage(input, recipients, &stored, &error)) {
+    sendResponse(conn, onlinetalk::common::PacketType::MessageSend, packet.header.request_id,
+                 "error", "STORE_FAILED", error, "");
+    return;
+  }
+
+  nlohmann::json ack;
+  ack["message_id"] = stored.message_id;
+  ack["created_at"] = stored.created_at;
+  sendResponse(conn, onlinetalk::common::PacketType::MessageSend, packet.header.request_id,
+               "ok", "", "", ack.dump());
+
+  nlohmann::json deliver_meta;
+  deliver_meta["message_id"] = stored.message_id;
+  deliver_meta["conversation_type"] = stored.conversation_type;
+  deliver_meta["conversation_id"] = stored.conversation_id;
+  deliver_meta["sender_id"] = stored.sender_id;
+  deliver_meta["sender_nickname"] = stored.sender_nickname;
+  deliver_meta["content"] = stored.content;
+  deliver_meta["created_at"] = stored.created_at;
+  const auto deliver_payload = deliver_meta.dump();
+
+  for (const auto& user_id : recipients) {
+    int fd = -1;
+    if (!sessions_.tryGetFd(user_id, &fd)) {
+      continue;
+    }
+    auto it = connections_.find(fd);
+    if (it == connections_.end()) {
+      continue;
+    }
+    it->second->queueWrite(buildPacket(onlinetalk::common::PacketType::MessageDeliver,
+                                       0,
+                                       deliver_payload,
+                                       nullptr));
+    updateEpollEvents(fd, true);
+    std::vector<int64_t> ids{stored.message_id};
+    std::string mark_error;
+    message_service_.markDelivered(user_id, ids, &mark_error);
+  }
+}
+
+void TcpServer::deliverOfflineMessages(const std::string& user_id, Connection& conn) {
+  while (true) {
+    std::vector<StoredMessage> messages;
+    std::string error;
+    const int batch = std::max(1, config_.history_page_size);
+    if (!message_service_.fetchUndelivered(user_id, batch, &messages, &error)) {
+      onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
+                                      "fetch offline messages failed: " + error);
+      return;
+    }
+    if (messages.empty()) {
+      return;
+    }
+
+    std::vector<int64_t> delivered_ids;
+    delivered_ids.reserve(messages.size());
+    for (const auto& msg : messages) {
+      nlohmann::json meta;
+      meta["message_id"] = msg.message_id;
+      meta["conversation_type"] = msg.conversation_type;
+      meta["conversation_id"] = msg.conversation_id;
+      meta["sender_id"] = msg.sender_id;
+      meta["sender_nickname"] = msg.sender_nickname;
+      meta["content"] = msg.content;
+      meta["created_at"] = msg.created_at;
+      conn.queueWrite(buildPacket(onlinetalk::common::PacketType::MessageDeliver, 0, meta.dump(), nullptr));
+      delivered_ids.push_back(msg.message_id);
+    }
+    updateEpollEvents(conn.fd(), true);
+    if (!message_service_.markDelivered(user_id, delivered_ids, &error)) {
+      onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
+                                      "mark offline delivered failed: " + error);
+      return;
+    }
+  }
 }
 
 void TcpServer::sendAuthError(Connection& conn,
@@ -466,6 +840,7 @@ void TcpServer::sendAuthError(Connection& conn,
   meta["message"] = message;
   auto packet = buildPacket(onlinetalk::common::PacketType::AuthError, request_id, meta.dump(), nullptr);
   conn.queueWrite(packet);
+  updateEpollEvents(conn.fd(), true);
 }
 
 void TcpServer::sendAuthOk(Connection& conn, uint64_t request_id) {
@@ -475,6 +850,8 @@ void TcpServer::sendAuthOk(Connection& conn, uint64_t request_id) {
     meta["user_id"] = session->user_id;
     meta["nickname"] = session->nickname;
   }
+  meta["registered"] = false;
+  meta["logged_in"] = true;
   auto users = sessions_.onlineUsers();
   nlohmann::json user_list = nlohmann::json::array();
   for (const auto& user : users) {
@@ -486,6 +863,38 @@ void TcpServer::sendAuthOk(Connection& conn, uint64_t request_id) {
   meta["online_users"] = std::move(user_list);
   auto packet = buildPacket(onlinetalk::common::PacketType::AuthOk, request_id, meta.dump(), nullptr);
   conn.queueWrite(packet);
+  updateEpollEvents(conn.fd(), true);
+}
+
+void TcpServer::sendResponse(Connection& conn,
+                             onlinetalk::common::PacketType type,
+                             uint64_t request_id,
+                             const std::string& status,
+                             const std::string& code,
+                             const std::string& message,
+                             const std::string& extra_meta_json) {
+  nlohmann::json meta;
+  if (!status.empty()) {
+    meta["status"] = status;
+  }
+  if (!code.empty()) {
+    meta["code"] = code;
+  }
+  if (!message.empty()) {
+    meta["message"] = message;
+  }
+  if (!extra_meta_json.empty()) {
+    nlohmann::json extra;
+    std::string parse_error;
+    if (parseJson(extra_meta_json, &extra, &parse_error)) {
+      for (auto it = extra.begin(); it != extra.end(); ++it) {
+        meta[it.key()] = it.value();
+      }
+    }
+  }
+  auto packet = buildPacket(type, request_id, meta.dump(), nullptr);
+  conn.queueWrite(packet);
+  updateEpollEvents(conn.fd(), true);
 }
 
 void TcpServer::broadcastUserList() {
@@ -542,6 +951,13 @@ void TcpServer::disconnect(int fd) {
   onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Info,
                                   "client disconnected fd=" + std::to_string(fd));
   broadcastUserList();
+}
+
+bool TcpServer::initDatabase(std::string* error) {
+  if (!database_.open(config_.db_path, error)) {
+    return false;
+  }
+  return database_.initSchema(error);
 }
 
 }  // namespace onlinetalk::server
