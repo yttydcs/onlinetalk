@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS message_targets (
 CREATE TABLE IF NOT EXISTS files (
   file_id TEXT PRIMARY KEY,
   uploader_id TEXT NOT NULL,
+  uploader_nickname TEXT NOT NULL,
   conversation_type TEXT NOT NULL,
   conversation_id TEXT NOT NULL,
   file_name TEXT NOT NULL,
@@ -144,6 +145,15 @@ CREATE TABLE IF NOT EXISTS files (
   sha256 TEXT NOT NULL,
   storage_path TEXT NOT NULL,
   created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_uploads (
+  file_id TEXT PRIMARY KEY,
+  uploader_id TEXT NOT NULL,
+  temp_path TEXT NOT NULL,
+  uploaded_size INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS file_targets (
@@ -160,7 +170,28 @@ CREATE INDEX IF NOT EXISTS idx_files_conversation ON files(conversation_type, co
 CREATE INDEX IF NOT EXISTS idx_file_targets_user ON file_targets(user_id, delivered_at);
 )SQL";
 
-  return execute(schema_sql, error);
+  if (!execute(schema_sql, error)) {
+    return false;
+  }
+
+  auto addColumnIfMissing = [&](const std::string& sql) -> bool {
+    std::string local_error;
+    if (!execute(sql, &local_error)) {
+      if (local_error.find("duplicate column name") != std::string::npos) {
+        return true;
+      }
+      if (error) {
+        *error = local_error;
+      }
+      return false;
+    }
+    return true;
+  };
+
+  if (!addColumnIfMissing("ALTER TABLE files ADD COLUMN uploader_nickname TEXT NOT NULL DEFAULT '';")) {
+    return false;
+  }
+  return true;
 }
 
 }  // namespace onlinetalk::server

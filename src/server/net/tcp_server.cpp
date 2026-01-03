@@ -24,6 +24,8 @@ namespace {
 constexpr int kMaxEvents = 64;
 constexpr size_t kMaxFieldLength = 64;
 constexpr size_t kMaxContentLength = 4096;
+constexpr size_t kMaxFileNameLength = 255;
+constexpr size_t kSha256HexLength = 64;
 
 bool setNonBlocking(int fd, std::string* error) {
   const int flags = ::fcntl(fd, F_GETFL, 0);
@@ -173,7 +175,8 @@ TcpServer::TcpServer(const onlinetalk::common::ServerConfig& config)
       database_(),
       auth_service_(database_),
       group_service_(database_),
-      message_service_(database_) {}
+      message_service_(database_),
+      file_service_(database_, config_.data_dir, config_.file_chunk_size) {}
 
 TcpServer::~TcpServer() {
   stop();
@@ -370,6 +373,12 @@ bool TcpServer::processPackets(Connection& conn) {
       case onlinetalk::common::PacketType::MessageSend:
         handleMessage(conn, packet);
         break;
+      case onlinetalk::common::PacketType::FileOffer:
+      case onlinetalk::common::PacketType::FileUploadChunk:
+      case onlinetalk::common::PacketType::FileUploadDone:
+      case onlinetalk::common::PacketType::FileDownloadRequest:
+        handleFile(conn, packet);
+        break;
       default:
         onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
                                         "unhandled packet type: " + std::to_string(packet.header.type));
@@ -526,6 +535,7 @@ void TcpServer::handleLogin(Connection& conn, const onlinetalk::common::Packet& 
   sendAuthOk(conn, packet.header.request_id);
   broadcastUserList();
   deliverOfflineMessages(user.user_id, conn);
+  deliverOfflineFiles(user.user_id, conn);
 }
 
 void TcpServer::handleGroup(Connection& conn, const onlinetalk::common::Packet& packet) {
@@ -794,6 +804,237 @@ void TcpServer::handleMessage(Connection& conn, const onlinetalk::common::Packet
   }
 }
 
+void TcpServer::handleFile(Connection& conn, const onlinetalk::common::Packet& packet) {
+  const auto* session = sessions_.getSession(conn.fd());
+  if (!session || !session->logged_in) {
+    sendResponse(conn,
+                 static_cast<onlinetalk::common::PacketType>(packet.header.type),
+                 packet.header.request_id,
+                 "error",
+                 "NOT_LOGGED_IN",
+                 "login required",
+                 "");
+    return;
+  }
+
+  nlohmann::json meta;
+  std::string error;
+  if (!parseJson(packet.meta_json, &meta, &error)) {
+    sendResponse(conn,
+                 static_cast<onlinetalk::common::PacketType>(packet.header.type),
+                 packet.header.request_id,
+                 "error",
+                 "INVALID_JSON",
+                 error,
+                 "");
+    return;
+  }
+
+  const auto type = static_cast<onlinetalk::common::PacketType>(packet.header.type);
+  if (type == onlinetalk::common::PacketType::FileOffer) {
+    const auto conversation_type = meta.value("conversation_type", "");
+    const auto conversation_id = meta.value("conversation_id", "");
+    const auto file_name = meta.value("file_name", "");
+    const auto sha256 = meta.value("sha256", "");
+    const auto file_id = meta.value("file_id", "");
+    const auto file_size = meta.value("file_size", static_cast<int64_t>(0));
+
+    if (!validateField(conversation_type, "conversation_type", kMaxFieldLength, &error) ||
+        !validateField(conversation_id, "conversation_id", kMaxFieldLength, &error) ||
+        !validateField(file_name, "file_name", kMaxFileNameLength, &error) ||
+        !validateField(sha256, "sha256", kSha256HexLength, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_REQUEST", error, "");
+      return;
+    }
+    if (sha256.size() != kSha256HexLength) {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_SHA256", "sha256 length invalid", "");
+      return;
+    }
+    if (file_size <= 0) {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_SIZE", "file_size must be positive", "");
+      return;
+    }
+
+    std::vector<std::string> recipients;
+    if (conversation_type == "private") {
+      std::string exists_error;
+      const bool exists = auth_service_.userExists(conversation_id, &exists_error);
+      if (!exists_error.empty()) {
+        sendResponse(conn, type, packet.header.request_id, "error", "USER_LOOKUP_FAILED", exists_error, "");
+        return;
+      }
+      if (!exists) {
+        sendResponse(conn, type, packet.header.request_id, "error", "TARGET_NOT_FOUND", "target user not found", "");
+        return;
+      }
+      recipients.push_back(conversation_id);
+    } else if (conversation_type == "group") {
+      std::string role;
+      if (!group_service_.getUserRole(session->user_id, conversation_id, &role, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "NOT_IN_GROUP", error, "");
+        return;
+      }
+      if (!group_service_.getGroupMembers(conversation_id, &recipients, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "GROUP_MEMBERS_FAILED", error, "");
+        return;
+      }
+    } else {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_CONVERSATION_TYPE",
+                   "use private or group", "");
+      return;
+    }
+
+    UploadInfo info;
+    if (!file_id.empty()) {
+      if (!file_service_.resumeUpload(file_id, session->user_id, &info, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "RESUME_FAILED", error, "");
+        return;
+      }
+    } else {
+      FileOffer offer;
+      offer.conversation_type = conversation_type;
+      offer.conversation_id = conversation_id;
+      offer.file_name = file_name;
+      offer.file_size = file_size;
+      offer.sha256 = sha256;
+      offer.uploader_id = session->user_id;
+      offer.uploader_nickname = session->nickname;
+      offer.recipients = std::move(recipients);
+      if (!file_service_.createUpload(offer, &info, &error)) {
+        sendResponse(conn, type, packet.header.request_id, "error", "OFFER_FAILED", error, "");
+        return;
+      }
+    }
+
+    nlohmann::json response;
+    response["file_id"] = info.file_id;
+    response["next_offset"] = info.uploaded_size;
+    response["chunk_size"] = file_service_.chunkSize();
+    sendResponse(conn, onlinetalk::common::PacketType::FileAccept, packet.header.request_id,
+                 "ok", "", "", response.dump());
+    return;
+  }
+
+  if (type == onlinetalk::common::PacketType::FileUploadChunk) {
+    const auto file_id = meta.value("file_id", "");
+    const auto offset = meta.value("offset", static_cast<int64_t>(0));
+    if (!validateField(file_id, "file_id", kMaxFieldLength, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_FILE_ID", error, "");
+      return;
+    }
+    if (packet.binary.empty()) {
+      sendResponse(conn, type, packet.header.request_id, "error", "EMPTY_CHUNK", "chunk is empty", "");
+      return;
+    }
+    if (static_cast<int>(packet.binary.size()) > file_service_.chunkSize()) {
+      sendResponse(conn, type, packet.header.request_id, "error", "CHUNK_TOO_LARGE", "chunk too large", "");
+      return;
+    }
+    UploadInfo info;
+    if (!file_service_.appendChunk(file_id, session->user_id, offset, packet.binary, &info, &error)) {
+      nlohmann::json extra;
+      if (error == "offset mismatch") {
+        UploadInfo current;
+        std::string resume_error;
+        if (file_service_.resumeUpload(file_id, session->user_id, &current, &resume_error)) {
+          extra["expected_offset"] = current.uploaded_size;
+        }
+      }
+      sendResponse(conn, type, packet.header.request_id, "error", "UPLOAD_FAILED", error, extra.dump());
+      return;
+    }
+    nlohmann::json extra;
+    extra["next_offset"] = info.uploaded_size;
+    sendResponse(conn, type, packet.header.request_id, "ok", "", "", extra.dump());
+    return;
+  }
+
+  if (type == onlinetalk::common::PacketType::FileUploadDone) {
+    const auto file_id = meta.value("file_id", "");
+    if (!validateField(file_id, "file_id", kMaxFieldLength, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_FILE_ID", error, "");
+      return;
+    }
+    FileNotice notice;
+    if (!file_service_.finalizeUpload(file_id, session->user_id, &notice, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "FINALIZE_FAILED", error, "");
+      return;
+    }
+
+    nlohmann::json done_meta;
+    done_meta["file_id"] = notice.file_id;
+    done_meta["conversation_type"] = notice.conversation_type;
+    done_meta["conversation_id"] = notice.conversation_id;
+    done_meta["file_name"] = notice.file_name;
+    done_meta["file_size"] = notice.file_size;
+    done_meta["sha256"] = notice.sha256;
+    done_meta["uploader_id"] = notice.uploader_id;
+    done_meta["uploader_nickname"] = notice.uploader_nickname;
+    done_meta["created_at"] = notice.created_at;
+    sendResponse(conn, onlinetalk::common::PacketType::FileDone, packet.header.request_id,
+                 "ok", "", "", done_meta.dump());
+
+    std::vector<std::string> targets;
+    if (file_service_.listTargets(file_id, &targets, &error)) {
+      std::vector<std::string> delivered;
+      for (const auto& target : targets) {
+        if (target == session->user_id) {
+          delivered.push_back(target);
+          continue;
+        }
+        int fd = -1;
+        if (!sessions_.tryGetFd(target, &fd)) {
+          continue;
+        }
+        auto it = connections_.find(fd);
+        if (it == connections_.end()) {
+          continue;
+        }
+        it->second->queueWrite(buildPacket(onlinetalk::common::PacketType::FileDone, 0, done_meta.dump(), nullptr));
+        updateEpollEvents(fd, true);
+        delivered.push_back(target);
+      }
+      if (!delivered.empty()) {
+        for (const auto& user_id : delivered) {
+          std::string mark_error;
+          file_service_.markDelivered(user_id, {file_id}, &mark_error);
+        }
+      }
+    }
+    return;
+  }
+
+  if (type == onlinetalk::common::PacketType::FileDownloadRequest) {
+    const auto file_id = meta.value("file_id", "");
+    const auto offset = meta.value("offset", static_cast<int64_t>(0));
+    if (!validateField(file_id, "file_id", kMaxFieldLength, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "INVALID_FILE_ID", error, "");
+      return;
+    }
+    std::vector<uint8_t> data;
+    FileNotice notice;
+    if (!file_service_.readChunk(file_id, session->user_id, offset, &data, &notice, &error)) {
+      sendResponse(conn, type, packet.header.request_id, "error", "DOWNLOAD_FAILED", error, "");
+      return;
+    }
+    const bool done = (offset + static_cast<int64_t>(data.size()) >= notice.file_size);
+    nlohmann::json meta_resp;
+    meta_resp["file_id"] = notice.file_id;
+    meta_resp["offset"] = offset;
+    meta_resp["file_size"] = notice.file_size;
+    meta_resp["file_name"] = notice.file_name;
+    meta_resp["sha256"] = notice.sha256;
+    meta_resp["done"] = done;
+    auto packet_out = buildPacket(onlinetalk::common::PacketType::FileDownloadChunk,
+                                  packet.header.request_id,
+                                  meta_resp.dump(),
+                                  &data);
+    conn.queueWrite(packet_out);
+    updateEpollEvents(conn.fd(), true);
+    return;
+  }
+}
+
 void TcpServer::deliverOfflineMessages(const std::string& user_id, Connection& conn) {
   while (true) {
     std::vector<StoredMessage> messages;
@@ -826,6 +1067,44 @@ void TcpServer::deliverOfflineMessages(const std::string& user_id, Connection& c
     if (!message_service_.markDelivered(user_id, delivered_ids, &error)) {
       onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
                                       "mark offline delivered failed: " + error);
+      return;
+    }
+  }
+}
+
+void TcpServer::deliverOfflineFiles(const std::string& user_id, Connection& conn) {
+  while (true) {
+    std::vector<FileNotice> notices;
+    std::string error;
+    const int batch = std::max(1, config_.history_page_size);
+    if (!file_service_.fetchUndelivered(user_id, batch, &notices, &error)) {
+      onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
+                                      "fetch offline files failed: " + error);
+      return;
+    }
+    if (notices.empty()) {
+      return;
+    }
+    std::vector<std::string> delivered_ids;
+    delivered_ids.reserve(notices.size());
+    for (const auto& notice : notices) {
+      nlohmann::json meta;
+      meta["file_id"] = notice.file_id;
+      meta["conversation_type"] = notice.conversation_type;
+      meta["conversation_id"] = notice.conversation_id;
+      meta["file_name"] = notice.file_name;
+      meta["file_size"] = notice.file_size;
+      meta["sha256"] = notice.sha256;
+      meta["uploader_id"] = notice.uploader_id;
+      meta["uploader_nickname"] = notice.uploader_nickname;
+      meta["created_at"] = notice.created_at;
+      conn.queueWrite(buildPacket(onlinetalk::common::PacketType::FileDone, 0, meta.dump(), nullptr));
+      delivered_ids.push_back(notice.file_id);
+    }
+    updateEpollEvents(conn.fd(), true);
+    if (!file_service_.markDelivered(user_id, delivered_ids, &error)) {
+      onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
+                                      "mark offline files delivered failed: " + error);
       return;
     }
   }
@@ -957,7 +1236,10 @@ bool TcpServer::initDatabase(std::string* error) {
   if (!database_.open(config_.db_path, error)) {
     return false;
   }
-  return database_.initSchema(error);
+  if (!database_.initSchema(error)) {
+    return false;
+  }
+  return file_service_.ensureStorage(error);
 }
 
 }  // namespace onlinetalk::server

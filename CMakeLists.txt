@@ -59,6 +59,7 @@ add_executable(onlinetalk_server
   src/server/net/connection.cpp
   src/server/net/tcp_server.cpp
   src/server/services/auth_service.cpp
+  src/server/services/file_service.cpp
   src/server/services/group_service.cpp
   src/server/services/id_generator.cpp
   src/server/services/message_service.cpp

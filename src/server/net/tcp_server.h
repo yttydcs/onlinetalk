@@ -11,6 +11,7 @@
 #include "common/protocol/packet.h"
 #include "server/net/connection.h"
 #include "server/services/auth_service.h"
+#include "server/services/file_service.h"
 #include "server/services/group_service.h"
 #include "server/services/message_service.h"
 #include "server/session/session_manager.h"
@@ -43,7 +44,9 @@ class TcpServer {
   void handleLogin(Connection& conn, const onlinetalk::common::Packet& packet);
   void handleGroup(Connection& conn, const onlinetalk::common::Packet& packet);
   void handleMessage(Connection& conn, const onlinetalk::common::Packet& packet);
+  void handleFile(Connection& conn, const onlinetalk::common::Packet& packet);
   void deliverOfflineMessages(const std::string& user_id, Connection& conn);
+  void deliverOfflineFiles(const std::string& user_id, Connection& conn);
   void sendAuthError(Connection& conn,
                      uint64_t request_id,
                      const std::string& code,
@@ -75,6 +78,7 @@ class TcpServer {
   AuthService auth_service_;
   GroupService group_service_;
   MessageService message_service_;
+  FileService file_service_;
 };
 
 }  // namespace onlinetalk::server
