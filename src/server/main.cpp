@@ -3,8 +3,10 @@
 #include "common/log.h"
 #include "server/net/tcp_server.h"
 
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -14,7 +16,27 @@ std::string resolveConfigPath(int argc, char** argv) {
       return argv[i + 1];
     }
   }
-  return "config/server.json";
+  std::vector<std::string> candidates = {
+      "config/server.json",
+      "../config/server.json",
+  };
+
+  std::error_code error;
+  const auto exe_path = std::filesystem::absolute(argv[0], error);
+  if (!error) {
+    const auto exe_dir = exe_path.parent_path();
+    if (!exe_dir.empty()) {
+      candidates.push_back((exe_dir / "config/server.json").lexically_normal().string());
+      candidates.push_back((exe_dir / "../config/server.json").lexically_normal().string());
+    }
+  }
+
+  for (const auto& path : candidates) {
+    if (std::filesystem::exists(path)) {
+      return path;
+    }
+  }
+  return candidates.front();
 }
 
 }  // namespace

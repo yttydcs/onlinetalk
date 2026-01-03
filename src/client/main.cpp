@@ -5,8 +5,10 @@
 #include <SDL.h>
 #include <SDL_ttf.h>
 
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -16,7 +18,27 @@ std::string resolveConfigPath(int argc, char** argv) {
       return argv[i + 1];
     }
   }
-  return "config/client.json";
+  std::vector<std::string> candidates = {
+      "config/client.json",
+      "../config/client.json",
+  };
+
+  std::error_code error;
+  const auto exe_path = std::filesystem::absolute(argv[0], error);
+  if (!error) {
+    const auto exe_dir = exe_path.parent_path();
+    if (!exe_dir.empty()) {
+      candidates.push_back((exe_dir / "config/client.json").lexically_normal().string());
+      candidates.push_back((exe_dir / "../config/client.json").lexically_normal().string());
+    }
+  }
+
+  for (const auto& path : candidates) {
+    if (std::filesystem::exists(path)) {
+      return path;
+    }
+  }
+  return candidates.front();
 }
 
 }  // namespace
