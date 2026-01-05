@@ -1,6 +1,8 @@
 #include "server/services/message_service.h"
 
 #include <chrono>
+#include <limits>
+#include <algorithm>
 
 namespace onlinetalk::server {
 
@@ -194,6 +196,89 @@ bool MessageService::markDelivered(const std::string& user_id,
     return false;
   }
   return ok;
+}
+
+bool MessageService::fetchHistory(const std::string& user_id,
+                                  const std::string& conversation_type,
+                                  const std::string& conversation_id,
+                                  int64_t before_message_id,
+                                  int limit,
+                                  std::vector<StoredMessage>* out,
+                                  std::string* error) {
+  if (!out) {
+    if (error) {
+      *error = "output list is null";
+    }
+    return false;
+  }
+  out->clear();
+  if (limit <= 0) {
+    limit = 1;
+  }
+  const auto before_id = before_message_id > 0
+                             ? before_message_id
+                             : std::numeric_limits<int64_t>::max();
+
+  std::string sql;
+  if (conversation_type == "private") {
+    sql =
+        "SELECT message_id, conversation_type, conversation_id, sender_id, sender_nickname, content, created_at "
+        "FROM messages "
+        "WHERE conversation_type = 'private' AND message_id < ? AND "
+        "((sender_id = ? AND conversation_id = ?) OR (sender_id = ? AND conversation_id = ?)) "
+        "ORDER BY message_id DESC LIMIT ?;";
+  } else {
+    sql =
+        "SELECT message_id, conversation_type, conversation_id, sender_id, sender_nickname, content, created_at "
+        "FROM messages "
+        "WHERE conversation_type = ? AND conversation_id = ? AND message_id < ? "
+        "ORDER BY message_id DESC LIMIT ?;";
+  }
+
+  Statement stmt(db_.handle(), sql, error);
+  if (!stmt.valid()) {
+    return false;
+  }
+
+  if (conversation_type == "private") {
+    sqlite3_bind_int64(stmt.get(), 1, before_id);
+    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, conversation_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, conversation_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt.get(), 6, limit);
+  } else {
+    sqlite3_bind_text(stmt.get(), 1, conversation_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, conversation_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 3, before_id);
+    sqlite3_bind_int(stmt.get(), 4, limit);
+  }
+
+  while (true) {
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW) {
+      StoredMessage msg;
+      msg.message_id = sqlite3_column_int64(stmt.get(), 0);
+      msg.conversation_type = textOrEmpty(stmt.get(), 1);
+      msg.conversation_id = textOrEmpty(stmt.get(), 2);
+      msg.sender_id = textOrEmpty(stmt.get(), 3);
+      msg.sender_nickname = textOrEmpty(stmt.get(), 4);
+      msg.content = textOrEmpty(stmt.get(), 5);
+      msg.created_at = sqlite3_column_int64(stmt.get(), 6);
+      out->push_back(std::move(msg));
+      continue;
+    }
+    if (rc == SQLITE_DONE) {
+      break;
+    }
+    if (error) {
+      *error = sqlite3_errmsg(db_.handle());
+    }
+    return false;
+  }
+
+  std::reverse(out->begin(), out->end());
+  return true;
 }
 
 }  // namespace onlinetalk::server

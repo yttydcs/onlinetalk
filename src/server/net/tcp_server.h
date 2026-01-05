@@ -44,6 +44,7 @@ class TcpServer {
   void handleLogin(Connection& conn, const onlinetalk::common::Packet& packet);
   void handleGroup(Connection& conn, const onlinetalk::common::Packet& packet);
   void handleMessage(Connection& conn, const onlinetalk::common::Packet& packet);
+  void handleHistory(Connection& conn, const onlinetalk::common::Packet& packet);
   void handleFile(Connection& conn, const onlinetalk::common::Packet& packet);
   void deliverOfflineMessages(const std::string& user_id, Connection& conn);
   void deliverOfflineFiles(const std::string& user_id, Connection& conn);

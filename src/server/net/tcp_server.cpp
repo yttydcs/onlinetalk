@@ -373,6 +373,9 @@ bool TcpServer::processPackets(Connection& conn) {
       case onlinetalk::common::PacketType::MessageSend:
         handleMessage(conn, packet);
         break;
+      case onlinetalk::common::PacketType::HistoryFetch:
+        handleHistory(conn, packet);
+        break;
       case onlinetalk::common::PacketType::FileOffer:
       case onlinetalk::common::PacketType::FileUploadChunk:
       case onlinetalk::common::PacketType::FileUploadDone:
@@ -802,6 +805,116 @@ void TcpServer::handleMessage(Connection& conn, const onlinetalk::common::Packet
     std::string mark_error;
     message_service_.markDelivered(user_id, ids, &mark_error);
   }
+}
+
+void TcpServer::handleHistory(Connection& conn, const onlinetalk::common::Packet& packet) {
+  const auto* session = sessions_.getSession(conn.fd());
+  if (!session || !session->logged_in) {
+    sendResponse(conn,
+                 static_cast<onlinetalk::common::PacketType>(packet.header.type),
+                 packet.header.request_id,
+                 "error",
+                 "NOT_LOGGED_IN",
+                 "login required",
+                 "");
+    return;
+  }
+
+  nlohmann::json meta;
+  std::string error;
+  if (!parseJson(packet.meta_json, &meta, &error)) {
+    sendResponse(conn,
+                 static_cast<onlinetalk::common::PacketType>(packet.header.type),
+                 packet.header.request_id,
+                 "error",
+                 "INVALID_JSON",
+                 error,
+                 "");
+    return;
+  }
+
+  const auto conversation_type = meta.value("conversation_type", "");
+  const auto conversation_id = meta.value("conversation_id", "");
+  const auto before_message_id = meta.value("before_message_id", static_cast<int64_t>(0));
+  auto limit = meta.value("limit", config_.history_page_size);
+
+  if (!validateField(conversation_type, "conversation_type", kMaxFieldLength, &error) ||
+      !validateField(conversation_id, "conversation_id", kMaxFieldLength, &error)) {
+    sendResponse(conn, onlinetalk::common::PacketType::HistoryResponse, packet.header.request_id,
+                 "error", "INVALID_REQUEST", error, "");
+    return;
+  }
+
+  const int max_limit = std::max(1, config_.history_page_size);
+  if (limit <= 0 || limit > max_limit) {
+    limit = max_limit;
+  }
+
+  if (conversation_type == "private") {
+    std::string exists_error;
+    const bool exists = auth_service_.userExists(conversation_id, &exists_error);
+    if (!exists_error.empty()) {
+      sendResponse(conn, onlinetalk::common::PacketType::HistoryResponse, packet.header.request_id,
+                   "error", "USER_LOOKUP_FAILED", exists_error, "");
+      return;
+    }
+    if (!exists) {
+      sendResponse(conn, onlinetalk::common::PacketType::HistoryResponse, packet.header.request_id,
+                   "error", "TARGET_NOT_FOUND", "target user not found", "");
+      return;
+    }
+  } else if (conversation_type == "group") {
+    std::string role;
+    if (!group_service_.getUserRole(session->user_id, conversation_id, &role, &error)) {
+      sendResponse(conn, onlinetalk::common::PacketType::HistoryResponse, packet.header.request_id,
+                   "error", "NOT_IN_GROUP", error, "");
+      return;
+    }
+  } else {
+    sendResponse(conn, onlinetalk::common::PacketType::HistoryResponse, packet.header.request_id,
+                 "error", "INVALID_CONVERSATION_TYPE", "use private or group", "");
+    return;
+  }
+
+  std::vector<StoredMessage> messages;
+  if (!message_service_.fetchHistory(session->user_id,
+                                     conversation_type,
+                                     conversation_id,
+                                     before_message_id,
+                                     limit,
+                                     &messages,
+                                     &error)) {
+    onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
+                                    "history fetch failed for user " + session->user_id + ": " + error);
+    sendResponse(conn, onlinetalk::common::PacketType::HistoryResponse, packet.header.request_id,
+                 "error", "HISTORY_FAILED", error, "");
+    return;
+  }
+
+  nlohmann::json payload;
+  payload["conversation_type"] = conversation_type;
+  payload["conversation_id"] = conversation_id;
+  nlohmann::json items = nlohmann::json::array();
+  for (const auto& msg : messages) {
+    nlohmann::json item;
+    item["message_id"] = msg.message_id;
+    item["sender_id"] = msg.sender_id;
+    item["sender_nickname"] = msg.sender_nickname;
+    item["content"] = msg.content;
+    item["created_at"] = msg.created_at;
+    items.push_back(std::move(item));
+  }
+  payload["messages"] = std::move(items);
+  payload["count"] = static_cast<int>(messages.size());
+  payload["next_before_message_id"] = messages.empty() ? 0 : messages.front().message_id;
+
+  sendResponse(conn,
+               onlinetalk::common::PacketType::HistoryResponse,
+               packet.header.request_id,
+               "ok",
+               "",
+               "",
+               payload.dump());
 }
 
 void TcpServer::handleFile(Connection& conn, const onlinetalk::common::Packet& packet) {

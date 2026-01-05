@@ -41,6 +41,13 @@ class MessageService {
   bool markDelivered(const std::string& user_id,
                      const std::vector<int64_t>& message_ids,
                      std::string* error);
+  bool fetchHistory(const std::string& user_id,
+                    const std::string& conversation_type,
+                    const std::string& conversation_id,
+                    int64_t before_message_id,
+                    int limit,
+                    std::vector<StoredMessage>* out,
+                    std::string* error);
 
  private:
   Database& db_;

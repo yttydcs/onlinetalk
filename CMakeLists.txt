@@ -80,6 +80,12 @@ target_compile_definitions(onlinetalk_server PRIVATE _GNU_SOURCE)
 
 add_executable(onlinetalk_client
   src/client/main.cpp
+  src/client/file_transfer/file_transfer_manager.cpp
+  src/client/history/history_manager.cpp
+  src/client/net/client_api.cpp
+  src/client/net/net_client.cpp
+  src/client/state/client_state.cpp
+  src/client/ui/ui_app.cpp
 )
 
 target_link_libraries(onlinetalk_client

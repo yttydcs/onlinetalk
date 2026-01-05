@@ -1,3 +1,8 @@
+#include "client/file_transfer/file_transfer_manager.h"
+#include "client/net/client_api.h"
+#include "client/net/net_client.h"
+#include "client/state/client_state.h"
+#include "client/ui/ui_app.h"
 #include "common/config.h"
 #include "common/fs.h"
 #include "common/log.h"
@@ -72,25 +77,31 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    SDL_Window* window = SDL_CreateWindow("OnlineTalk",
-                                          SDL_WINDOWPOS_CENTERED,
-                                          SDL_WINDOWPOS_CENTERED,
-                                          config.window_width,
-                                          config.window_height,
-                                          SDL_WINDOW_SHOWN);
-    if (!window) {
+    onlinetalk::client::NetClient net;
+    if (net.connectTo(config.server_host, config.server_port, &error)) {
+      net.start();
+    } else {
+      onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
+                                      "initial connect failed: " + error);
+    }
+
+    onlinetalk::client::ClientApi api(net);
+    onlinetalk::client::ClientState state;
+    onlinetalk::client::FileTransferManager transfers(config.data_dir);
+
+    onlinetalk::client::UiApp app(config, net, api, state, transfers);
+    if (!app.init(&error)) {
       onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Error,
-                                      std::string("SDL_CreateWindow failed: ") + SDL_GetError());
+                                      "UI init failed: " + error);
+      net.stop();
       TTF_Quit();
       SDL_Quit();
       return 1;
     }
 
-    onlinetalk::common::Logger::log(onlinetalk::common::LogLevel::Warn,
-                                    "client UI not implemented yet");
-
-    SDL_Delay(500);
-    SDL_DestroyWindow(window);
+    app.run();
+    app.shutdown();
+    net.stop();
     TTF_Quit();
     SDL_Quit();
     return 0;
